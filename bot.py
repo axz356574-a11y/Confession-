@@ -223,9 +223,9 @@ async def post_confession(interaction: Interaction, confession_text: str):
     sent_msg = await channel.send(embed=embed)
     try:
         thread = await sent_msg.create_thread(name=f"Replies #{confession_id}", auto_archive_duration=1440)
-        await sent_msg.edit(view=ReplyOnlyView(thread.id, confession_id))
+        await sent_msg.edit(view=ConfessionActionView(thread.id, confession_id))
     except Exception:
-        await sent_msg.edit(view=ReplyOnlyView(0, confession_id))
+        await sent_msg.edit(view=ConfessionActionView(0, confession_id))
 
     admin_embed = Embed(
         title=f"Confession #{confession_id} Submitted (IDENTITY)",
@@ -282,36 +282,29 @@ class ReplyModal(Modal):
 
         await interaction.response.send_message("Your anonymous reply was posted.", ephemeral=True)
 
-class ReplyOnlyView(View):
+# ======================
+# Two-button view
+# ======================
+
+class ConfessionActionView(View):
     def __init__(self, thread_id: int, confession_id: int):
         super().__init__(timeout=None)
         self.thread_id = thread_id
         self.confession_id = confession_id
-        btn = Button(label="Reply Anonymously", style=nextcord.ButtonStyle.secondary)
-        btn.callback = self.open_reply_modal
-        self.add_item(btn)
+
+        reply_btn = Button(label="Reply Anonymously", style=nextcord.ButtonStyle.secondary)
+        reply_btn.callback = self.open_reply_modal
+        self.add_item(reply_btn)
+
+        submit_btn = Button(label="Submit Your Confession", style=nextcord.ButtonStyle.primary)
+        submit_btn.callback = self.open_confess_modal
+        self.add_item(submit_btn)
 
     async def open_reply_modal(self, interaction: Interaction):
         await interaction.response.send_modal(ReplyModal(self.thread_id, self.confession_id))
 
-class ConfessionButtonsPending(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        submit_btn = Button(label="Submit Confession", style=nextcord.ButtonStyle.primary)
-        submit_btn.callback = self.open_confess_modal
-        self.add_item(submit_btn)
-
-        reply_btn = Button(label="Reply Anonymously", style=nextcord.ButtonStyle.secondary)
-        reply_btn.callback = self.reply_anonymous_pending
-        self.add_item(reply_btn)
-
     async def open_confess_modal(self, interaction: Interaction):
         await interaction.response.send_modal(ConfessSubmitModal())
-
-    async def reply_anonymous_pending(self, interaction: Interaction):
-        await interaction.response.send_message(
-            "Confession must be submitted first before replies can be made.", ephemeral=True
-        )
 
 # ======================
 # Slash commands
@@ -322,7 +315,7 @@ async def confess_command(interaction: Interaction):
     await interaction.response.send_modal(ConfessModal())
 
 # ======================
-# Timezone & device helpers
+# TZCheck helpers
 # ======================
 
 def hourly_activity_from_timestamps(ts_list):
@@ -360,32 +353,28 @@ def device_preference(dev_dict):
     return primary, dict(sorted_dev)
 
 # ======================
-# /tzcheck command
+# TZCheck command
 # ======================
 
 @bot.slash_command(name="tzcheck", description="Analyze a user's activity and probable timezone & device usage (restricted)")
 async def tzcheck(interaction: Interaction, user: nextcord.User):
     if interaction.user.id not in ALLOWED_TZ_CHECK:
-        return await interaction.response.send_message("You are not authorized.", ephemeral=True)
-
+        return await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
     await interaction.response.defer(ephemeral=True)
     try:
         account_age = datetime.now(timezone.utc) - user.created_at
         if account_age < timedelta(hours=48):
-            await interaction.followup.send(f"User {user} is very new ({account_age}).", ephemeral=True)
+            await interaction.followup.send(f"User {user} is very new ({account_age}). Too new to analyze reliably.", ephemeral=True)
             return
-
         uid = str(user.id)
         async with tz_data_lock:
-            info = tz_data.get(uid, {"messages": [], "devices": {"mobile":0,"desktop":0,"web":0}, "last_seen":0})
-
+            info = tz_data.get(uid, {"messages": [], "devices": {"mobile":0,"desktop":0,"web":0}, "last_seen": 0})
         msg_list = info.get("messages", [])
         if len(msg_list) < 5:
-            await interaction.followup.send(f"Not enough data ({len(msg_list)} samples).", ephemeral=True)
+            await interaction.followup.send(f"Not enough data to analyze user {user}. Only {len(msg_list)} samples.", ephemeral=True)
             return
-
         hist = hourly_activity_from_timestamps(msg_list)
-        top_hours = top_n_hours(hist, 3)
+        top_hours = top_n_hours(hist, n=3)
         peak_hour = top_hours[0][0]
         peak_count = top_hours[0][1] or 1
         threshold = max(1, int(peak_count * 0.15))
@@ -396,23 +385,26 @@ async def tzcheck(interaction: Interaction, user: nextcord.User):
                 return "None"
             hours_sorted = sorted(hours)
             ranges = []
-            start = prev = hours_sorted[0]
+            start = hours_sorted[0]
+            prev = start
             for h in hours_sorted[1:]:
                 if h == prev + 1:
                     prev = h
+                    continue
                 else:
                     ranges.append((start, prev))
-                    start = prev = h
+                    start = h
+                    prev = h
             ranges.append((start, prev))
             return ", ".join([f"{a:02d}:00-{(b+1)%24:02d}:00 UTC" for a,b in ranges])
 
         active_window_str = hour_ranges(active_hours)
         candidates = guess_timezones_from_peak(peak_hour)
-        candidate_texts = [f"UTC{'+' if off>=0 else ''}{off} (local peak ~{local_hour:02d}:00)" for off, local_hour, _ in candidates]
+        candidate_texts = [f"UTC{('+' if off>=0 else '')}{off} (local peak ~{local_hour:02d}:00)" for off,local_hour,_ in candidates]
         primary_device, device_counts = device_preference(info.get("devices", {}))
         total_samples = len(msg_list)
         prominence = peak_count / max(1, sum(hist))
-        confidence_score = min(100, int((min(total_samples,1000)/10)*prominence*10))
+        confidence_score = min(100, int((min(total_samples, 1000)/10)*prominence*10))
         confidence = f"{confidence_score}%"
 
         embed = Embed(title=f"Activity & Timezone Analysis — {user}", color=0x2b90ff)
@@ -422,12 +414,12 @@ async def tzcheck(interaction: Interaction, user: nextcord.User):
         embed.add_field(name="Device counts", value=json.dumps(device_counts), inline=False)
         embed.add_field(name="Most active UTC hour(s)", value=", ".join([f"{h:02d}:00 ({c})" for h,c in top_hours]), inline=False)
         embed.add_field(name="Active window (UTC)", value=active_window_str, inline=False)
-        embed.add_field(name="Likely timezone offsets (candidates)", value="\n".join(candidate_texts) or "No strong peak", inline=False)
+        embed.add_field(name="Likely timezone offsets (candidates)", value="\n".join(candidate_texts) or "No strong evening/night peak found", inline=False)
         embed.add_field(name="Confidence (heuristic)", value=confidence, inline=True)
-        embed.set_footer(text="Probabilistic — treat as investigative lead.")
-
+        embed.set_footer(text="This is probabilistic — treat as investigative lead, not proof.")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
+        # DM full report to admins
         report = {
             "target": f"{user} (ID: {user.id})",
             "samples": total_samples,
@@ -442,17 +434,20 @@ async def tzcheck(interaction: Interaction, user: nextcord.User):
             try:
                 admin_user = await bot.fetch_user(admin)
                 if admin_user:
-                    await admin_user.send(f"TZCHECK run by {interaction.user} on {user}:\n\n{report_text}")
+                    try:
+                        await admin_user.send(f"TZCHECK run by {interaction.user} on {user}:\n\n{report_text}")
+                    except Exception:
+                        pass
             except Exception:
                 pass
     except Exception as e:
         try:
-            await interaction.followup.send(f"Error: {e}", ephemeral=True)
+            await interaction.followup.send(f"An error occurred while analyzing: {e}", ephemeral=True)
         except Exception:
             pass
 
 # ======================
-# /check_account
+# Check account command
 # ======================
 
 @bot.slash_command(name="check_account", description="Check account creation date")
